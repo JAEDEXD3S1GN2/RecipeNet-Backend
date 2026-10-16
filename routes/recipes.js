@@ -6,6 +6,40 @@ module.exports = (app) => {
   const Recipes = app.db.models.Recipes;
   const Reviews = app.db.models.Reviews;
   const Users = app.db.models.Users;
+  const { fn, col, Op } = app.db.Sequelize;
+
+  // Average star rating and number of ratings per recipe, keyed by recipe id.
+  // Reviews with rate 0 (no rating given) are left out of the average.
+  const getRatings = async (recipeIds) => {
+    if (!recipeIds.length) return {};
+    const rows = await Reviews.findAll({
+      attributes: [
+        "recipe_id",
+        [fn("AVG", col("rate")), "average_rating"],
+        [fn("COUNT", col("id")), "rating_count"],
+      ],
+      where: { recipe_id: recipeIds, rate: { [Op.gt]: 0 } },
+      group: ["recipe_id"],
+      raw: true,
+    });
+    const ratings = {};
+    rows.forEach((row) => {
+      ratings[row.recipe_id] = {
+        average_rating: Math.round(parseFloat(row.average_rating) * 10) / 10,
+        rating_count: parseInt(row.rating_count, 10),
+      };
+    });
+    return ratings;
+  };
+
+  // Adds average_rating and rating_count to each recipe.
+  const withRatings = async (recipes) => {
+    const ratings = await getRatings(recipes.map((r) => r.id));
+    return recipes.map((recipe) => ({
+      ...recipe.toJSON(),
+      ...(ratings[recipe.id] || { average_rating: 0, rating_count: 0 }),
+    }));
+  };
 
   app
     .route("/recipes")
@@ -63,6 +97,7 @@ module.exports = (app) => {
           },
         ],
       })
+        .then(withRatings)
         .then((recipes) => {
           res.json({ recipes: recipes });
         })
@@ -287,6 +322,7 @@ module.exports = (app) => {
         },
       ],
     })
+      .then(withRatings)
       .then((recipes) => {
         res.json({ recipes });
       })
@@ -360,11 +396,12 @@ module.exports = (app) => {
         },
       ],
     })
-      .then((result) => {
+      .then(async (result) => {
         if (result === null) {
           res.json({ msg: "Recipe Not Found" });
         } else {
-          res.json(result);
+          const [recipe] = await withRatings([result]);
+          res.json(recipe);
         }
       })
       .catch((error) => {
@@ -464,17 +501,19 @@ module.exports = (app) => {
   app.post(
     "/recipes/:recipe_id/reviews",
     app.auth.authenticate(),
-    (req, res) => {
+    async (req, res) => {
       /**
        * @api {post} /recipes/:recipe_id/reviews Create a review for a recipe
        * @apiGroup Reviews
        * @apiParam {Number} recipe_id Recipe id
-       * @apiParam {String} text Review text
-       * @apiParam {Number} rating Review rating (1-5)
+       * @apiParam {String} description Review text
+       * @apiParam {Number} rate Star rating, a whole number from 1 to 5
+       * @apiDescription Each user has one review per recipe. Posting again
+       * updates that user's existing review instead of adding a new one.
        * @apiParamExample {json} Input
        * {
-       *   "text": "Great recipe!",
-       *   "rating": 5
+       *   "description": "Great recipe!",
+       *   "rate": 5
        * }
        * @apiHeaderExample {json} Header-Example:
        *     {
@@ -502,14 +541,42 @@ module.exports = (app) => {
        *   "msg": "Error message"
        * }
        */
-      req.body.user_id = req.user.id;
-      Reviews.create(req.body)
-        .then((result) => {
-          res.json(result);
-        })
-        .catch((error) => {
-          res.json({ msg: error.message });
+      const rate = Number(req.body.rate);
+      if (!Number.isInteger(rate) || rate < 1 || rate > 5) {
+        return res
+          .status(400)
+          .json({ msg: "Rating must be a whole number from 1 to 5" });
+      }
+
+      const recipe_id = req.params.recipe_id;
+      const user_id = req.user.id;
+      const description = req.body.description || "";
+
+      try {
+        const recipe = await Recipes.findByPk(recipe_id);
+        if (!recipe) {
+          return res.status(404).json({ msg: "Recipe Not Found" });
+        }
+
+        // One review per user per recipe: update it if it already exists.
+        const existing = await Reviews.findOne({
+          where: { recipe_id, user_id },
         });
+        if (existing) {
+          await existing.update({ description, rate });
+          return res.json(existing);
+        }
+
+        const result = await Reviews.create({
+          recipe_id,
+          user_id,
+          description,
+          rate,
+        });
+        res.json(result);
+      } catch (error) {
+        res.status(412).json({ msg: error.message });
+      }
     }
   );
 
@@ -535,8 +602,9 @@ module.exports = (app) => {
      */
     Reviews.destroy({ where: { id: req.params.id, user_id: req.user.id } })
       .then((result) => {
-        if (result === null) {
-          res.json({ msg: "Review Not Found" });
+        // destroy() returns how many rows were deleted
+        if (!result) {
+          res.status(404).json({ msg: "Review Not Found" });
         } else {
           res.sendStatus(204);
         }
