@@ -15,6 +15,11 @@ module.exports = (sequelize, DataType) => {
       type: DataType.INTEGER,
       allowNull: true,
       defaultValue: 0,
+      // 0 = no rating (older reviews), 1-5 = stars
+      validate: {
+        min: 0,
+        max: 5,
+      },
     },
 
     recipe_id: {
